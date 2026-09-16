@@ -16,7 +16,8 @@ const FONT_SLIDER_PIXELS_PER_STEP = 2;
 const FONT_SLIDER_VISUAL_MAX = 96;
 const GROUP_FONT_BAR_ATTR = "data-dj-group-title-bar";
 const GROUP_FONT_BAR_WIDTH = 236;
-const TOOLBOX_SUPPRESS_CLASS = "djGroupTitleToolboxSuppressed";
+// Breathing room kept between the bar and ComfyUI's own selection toolbox.
+const SELECTION_TOOLBOX_GAP = 6;
 const DOUBLE_CLICK_SLOP = 6;
 const DOUBLE_CLICK_TIME = 300;
 const TITLE_ALIGNMENTS = new Set(["left", "center", "right"]);
@@ -663,11 +664,6 @@ function installFontSliderStyles() {
     const style = document.createElement("style");
     style.id = "dj-group-title-bar-styles";
     style.textContent = [
-        // The stock selection toolbox is anchored to the selection bounds and
-        // appears above the group the moment its title is clicked. Font editing
-        // owns that gesture instead, so it is hidden only while the bar is live.
-        `body.${TOOLBOX_SUPPRESS_CLASS} .selection-toolbox,`,
-        `body.${TOOLBOX_SUPPRESS_CLASS} [data-testid="selection-toolbox"] { display: none !important; }`,
         `[${GROUP_FONT_BAR_ATTR}] input::-webkit-outer-spin-button,`,
         `[${GROUP_FONT_BAR_ATTR}] input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }`,
     ].join("\n");
@@ -706,7 +702,6 @@ function installFontSliderBar() {
     let frameHandle = 0;
     let pending = null;
     let lastTitleClick = null;
-    let toolboxSuppressed = false;
 
     const clampFontSize = (value) => {
         const numeric = Number(value);
@@ -714,12 +709,35 @@ function installFontSliderBar() {
         return Math.max(MIN_GROUP_FONT_SIZE, Math.min(MAX_GROUP_FONT_SIZE, Math.round(base)));
     };
 
-    const setToolboxSuppressed = (on) => {
-        const next = Boolean(on);
-        if (toolboxSuppressed === next) return;
-        toolboxSuppressed = next;
-        document.body?.classList.toggle(TOOLBOX_SUPPRESS_CLASS, next);
+    // ComfyUI's own selection toolbox is left alone: it floats over the selected
+    // group exactly as it does without this plugin. Its wrapper is positioned by
+    // two CSS custom properties, so the bar can read where the toolbox will
+    // settle - even mid entrance transition - and step aside instead of hiding
+    // it.
+    const getSelectionToolboxRect = () => {
+        const element = document.querySelector('[data-testid="selection-toolbox"]');
+        if (!element) return null;
+        const width = element.offsetWidth;
+        const height = element.offsetHeight;
+        if (!width || !height) return null;
+
+        const wrapper = element.parentElement;
+        const style = wrapper ? window.getComputedStyle(wrapper) : null;
+        const x = Number.parseFloat(style?.getPropertyValue("--tb-x") ?? "");
+        const y = Number.parseFloat(style?.getPropertyValue("--tb-y") ?? "");
+        if (Number.isFinite(x) && Number.isFinite(y)) {
+            return { left: x, top: y, right: x + width, bottom: y + height };
+        }
+
+        const rect = element.getBoundingClientRect();
+        if (!rect.width || !rect.height) return null;
+        return { left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom };
     };
+
+    const rectanglesOverlap = (a, b) => a.left < b.right
+        && b.left < a.right
+        && a.top < b.bottom
+        && b.top < a.bottom;
 
     const getRenderedTitleHeight = (group) => {
         const rendered = Number(group?.titleHeight);
@@ -756,16 +774,30 @@ function installFontSliderBar() {
         const canvasRect = canvasElement.getBoundingClientRect();
         const width = panel.offsetWidth || GROUP_FONT_BAR_WIDTH;
         const height = panel.offsetHeight || 34;
+        const maxTop = Math.max(8, window.innerHeight - height - 8);
         // Flush with the group's left edge and the title's bottom edge, then
         // clamped so the bar stays reachable near the viewport borders.
         const left = Math.min(
             Math.max(8, canvasRect.left + localX),
             Math.max(8, window.innerWidth - width - 8),
         );
-        const top = Math.min(
-            Math.max(8, canvasRect.top + localY),
-            Math.max(8, window.innerHeight - height - 8),
-        );
+        let top = Math.min(Math.max(8, canvasRect.top + localY), maxTop);
+
+        // Step around the official selection toolbox instead of covering it: the
+        // gap above it wins, and the bar only drops below when the viewport has
+        // no room left up there.
+        const toolboxRect = getSelectionToolboxRect();
+        if (toolboxRect && rectanglesOverlap(
+            { left, top, right: left + width, bottom: top + height },
+            toolboxRect,
+        )) {
+            const aboveToolbox = toolboxRect.top - height - SELECTION_TOOLBOX_GAP;
+            const belowToolbox = toolboxRect.bottom + SELECTION_TOOLBOX_GAP;
+            if (aboveToolbox >= 8) top = aboveToolbox;
+            else if (belowToolbox <= maxTop) top = belowToolbox;
+        }
+
+        top = Math.min(Math.max(8, top), maxTop);
         panel.style.left = `${Math.round(left)}px`;
         panel.style.top = `${Math.round(top)}px`;
     };
@@ -854,7 +886,6 @@ function installFontSliderBar() {
         panelState = null;
         stopFollow();
         if (panel) panel.style.display = "none";
-        setToolboxSuppressed(false);
     };
 
     const ensurePanel = () => {
@@ -989,12 +1020,10 @@ function installFontSliderBar() {
         panel.style.display = "flex";
         positionPanel();
         startFollow();
-        setToolboxSuppressed(true);
     };
 
     const cancelPending = () => {
         pending = null;
-        if (!panelState) setToolboxSuppressed(false);
     };
 
     const getGroupTitleAtEvent = (event) => {
@@ -1035,34 +1064,20 @@ function installFontSliderBar() {
         }, 0);
     };
 
-    // Consumes the deselect armed by a plain title press. A press that drifted
-    // past the canvas' own click threshold was a drag, and a drag has to keep the
-    // groups the user already selected: only a real click releases the selection.
-    const releaseTitleDeselect = (dragged) => {
-        const canvas = titleDeselectCanvas;
-        titleDeselectCanvas = null;
-        if (!canvas || dragged) return;
-        window.setTimeout(() => {
-            groupTitleDragGroup = null;
-            canvas.deselectAll?.();
-        }, 0);
-    };
-
+    // Consumed on release. A drag leaves the click alone and keeps the groups
+    // the user already selected; a real click runs the stock selection and the
+    // group stays selected, exactly as it does without this plugin.
     const handlePointerUp = () => {
         const pressed = pending;
         pending = null;
         const dragged = Boolean(pressed?.moved);
         releaseAdditiveSelectionCleanup();
-        releaseTitleDeselect(dragged);
         if (!pressed) return;
 
         // The bar opens on the release itself - no timer in between - so it is
         // there the moment the title is clicked. A drag opens nothing: the bar is
         // for editing a title, not for carrying a group around the canvas.
-        if (dragged) {
-            if (!panelState) setToolboxSuppressed(false);
-            return;
-        }
+        if (dragged) return;
         window.setTimeout(() => openPanel(pressed.group), 0);
     };
 
@@ -1124,7 +1139,6 @@ function installFontSliderBar() {
             clientY: event.clientY,
             moved: false,
         };
-        setToolboxSuppressed(true);
     };
 
     // Uses the canvas' own click drift, so "click" here means exactly what it
@@ -1195,13 +1209,6 @@ let groupTitleDragCleanup = null;
 // press and when the drag ends.
 let groupTitleDragGroup = null;
 
-// Armed by a plain title press and consumed on release. The deselect that keeps
-// the stock selection toolbox away from the font bar has to wait for the
-// release: a press that turns into a drag must keep the groups the user already
-// selected, otherwise dragging one group of a multi-selection would move that
-// group alone.
-let titleDeselectCanvas = null;
-
 // The stock canvas matches Ctrl/Cmd before it looks for a group title: with
 // "Comfy.Canvas.LeftMouseClickBehavior" set to `panning` it hands the press to
 // its box-select branch and returns, so the group branch below - and with it the
@@ -1244,7 +1251,6 @@ function patchCanvasPrototype() {
             // Re-armed on every pointer down so a stale cleanup can never fire.
             groupTitleDragCleanup = null;
             groupTitleDragGroup = null;
-            titleDeselectCanvas = null;
             const graph = this.graph;
             const x = Number(event?.canvasX);
             const y = Number(event?.canvasY);
@@ -1323,17 +1329,14 @@ function patchCanvasPrototype() {
                 return result;
             }
 
-            // A plain click on the title bar must not leave a selection behind.
-            // The stock selection toolbox shows up for *any* selection, a group's
-            // included, and would cover the font bar. The deselect therefore waits
-            // for the release: a press that turns into a drag has to keep the
-            // groups the user already had selected, so dragging one group of a
-            // multi-selection still moves the whole selection with its nodes.
+            // A plain click on the title bar keeps the stock pointer.onClick, so
+            // the native processSelect(group, e) still runs on release: the group
+            // stays selected and ComfyUI's selection toolbox pops up over it just
+            // like it does without this plugin. The bar is the one that moves -
+            // positionPanel steps it around the toolbox.
             const canvas = this;
             const before = new Set(canvas.selectedItems ?? []);
             groupTitleDragGroup = group;
-            if (canvas.pointer) canvas.pointer.onClick = undefined;
-            titleDeselectCanvas = canvas;
             // Dragging still needs the group selected, and _startDraggingItems
             // selects it once the pointer moves. Only what the drag itself adds is
             // dropped when the move ends, so the pre-drag selection survives and
@@ -1483,6 +1486,20 @@ function patchCanvasPrototype() {
             });
 
             const menuInfo = insertGroupOptionsNearTop(canvasOptions, inlineGroupOptions);
+            // ComfyUI closes the official group menu with a separator plus the
+            // Edit Group submenu. Rebuilding the menu here would drop it, so it is
+            // reproduced verbatim - same label, same submenu title, same source
+            // (group.getMenuOptions()) - and stays the last entry, exactly where
+            // the stock menu puts it.
+            menuInfo.push(null, {
+                content: "Edit Group",
+                has_submenu: true,
+                submenu: {
+                    title: "Group",
+                    extra: group,
+                    options: groupOptions,
+                },
+            });
             new ContextMenu(menuInfo, { event });
         }
 
