@@ -16,8 +16,14 @@ const FONT_SLIDER_PIXELS_PER_STEP = 2;
 const FONT_SLIDER_VISUAL_MAX = 96;
 const GROUP_FONT_BAR_ATTR = "data-dj-group-title-bar";
 const GROUP_FONT_BAR_WIDTH = 236;
-// Breathing room kept between the bar and ComfyUI's own selection toolbox.
+// ComfyUI's own selection toolbox, and the padding kept between it and the bar.
+const SELECTION_TOOLBOX_SELECTOR = '[data-testid="selection-toolbox"], .selection-toolbox';
+const SELECTION_TOOLBOX_SETTING = "Comfy.Canvas.SelectionToolbox";
 const SELECTION_TOOLBOX_GAP = 6;
+// Only used when the toolbox cannot be measured at all - its real height is
+// around 42px, kept slightly generous so the bar never lands a few pixels short.
+const SELECTION_TOOLBOX_FALLBACK_WIDTH = 320;
+const SELECTION_TOOLBOX_FALLBACK_HEIGHT = 48;
 const DOUBLE_CLICK_SLOP = 6;
 const DOUBLE_CLICK_TIME = 300;
 const TITLE_ALIGNMENTS = new Set(["left", "center", "right"]);
@@ -709,29 +715,107 @@ function installFontSliderBar() {
         return Math.max(MIN_GROUP_FONT_SIZE, Math.min(MAX_GROUP_FONT_SIZE, Math.round(base)));
     };
 
-    // ComfyUI's own selection toolbox is left alone: it floats over the selected
-    // group exactly as it does without this plugin. Its wrapper is positioned by
-    // two CSS custom properties, so the bar can read where the toolbox will
-    // settle - even mid entrance transition - and step aside instead of hiding
-    // it.
-    const getSelectionToolboxRect = () => {
-        const element = document.querySelector('[data-testid="selection-toolbox"]');
-        if (!element) return null;
-        const width = element.offsetWidth;
-        const height = element.offsetHeight;
-        if (!width || !height) return null;
+    // ComfyUI's official selection toolbox floats over the selected item(s),
+    // anchored on the selection's horizontal middle and 10px above its top edge.
+    // Zoomed out, a group title is only a few pixels tall, so the bar's usual
+    // resting place - the title's bottom edge - lands inside the toolbox. The bar
+    // steps above the toolbox instead of being covered by it.
+    //
+    // The toolbox is located from two independent sources, because neither is
+    // guaranteed to answer: the live DOM, and ComfyUI's own placement formula
+    // applied to the current selection. A frontend rename, a missing
+    // data-testid or a toolbox that is mid transition therefore cannot silently
+    // kill the dodge.
+    const isSelectionToolboxEnabled = () => {
+        try {
+            const settings = app.ui?.settings;
+            if (typeof settings?.getSettingValue !== "function") return true;
+            return settings.getSettingValue(SELECTION_TOOLBOX_SETTING) !== false;
+        } catch (error) {
+            console.warn("[DJ_GroupTitle] could not read the selection toolbox setting", error);
+            return true;
+        }
+    };
 
-        const wrapper = element.parentElement;
-        const style = wrapper ? window.getComputedStyle(wrapper) : null;
-        const x = Number.parseFloat(style?.getPropertyValue("--tb-x") ?? "");
-        const y = Number.parseFloat(style?.getPropertyValue("--tb-y") ?? "");
-        if (Number.isFinite(x) && Number.isFinite(y)) {
-            return { left: x, top: y, right: x + width, bottom: y + height };
+    // The wrapper carries the toolbox' final resting place in the two custom
+    // properties it is translated by, so the target position is known even while
+    // the entrance transition is still running - reading the live rect instead
+    // would make the bar chase a moving box.
+    const getToolboxAnchorFromDom = (element) => {
+        let node = element;
+        for (let depth = 0; node && depth < 4; depth += 1, node = node.parentElement) {
+            const style = window.getComputedStyle(node);
+            const x = Number.parseFloat(style.getPropertyValue("--tb-x"));
+            const y = Number.parseFloat(style.getPropertyValue("--tb-y"));
+            if (Number.isFinite(x) && Number.isFinite(y)) return [x, y];
+        }
+        return null;
+    };
+
+    // Mirrors getFullNodeBounds in ComfyUI: a node's frame includes the title bar
+    // above pos[1], a group's frame starts at pos[1].
+    const getSelectionWorldBounds = () => {
+        const items = Array.from(canvas.selectedItems ?? []);
+        const nodeTitleHeight = Number(globalThis.LiteGraph?.NODE_TITLE_HEIGHT) || 30;
+        let left = Infinity;
+        let top = Infinity;
+        let right = -Infinity;
+        let bottom = -Infinity;
+        for (const item of items) {
+            const pos = item?.pos;
+            const size = item?.size;
+            if (!Array.isArray(pos) || !Array.isArray(size)) continue;
+            const itemTop = isGroupItem(item) ? Number(pos[1]) : Number(pos[1]) - nodeTitleHeight;
+            left = Math.min(left, Number(pos[0]));
+            top = Math.min(top, itemTop);
+            right = Math.max(right, Number(pos[0]) + Number(size[0]));
+            bottom = Math.max(bottom, Number(pos[1]) + Number(size[1]));
+        }
+        if (![left, top, right, bottom].every(Number.isFinite)) return null;
+        return { left, top, right, bottom };
+    };
+
+    const predictSelectionToolboxRect = (width, height) => {
+        const bounds = getSelectionWorldBounds();
+        if (!bounds) return null;
+        const ds = canvas.ds ?? {};
+        const scale = Number(ds.scale) || 1;
+        const offsetX = Number(ds.offset?.[0]) || 0;
+        const offsetY = Number(ds.offset?.[1]) || 0;
+        const canvasRect = canvasElement.getBoundingClientRect();
+        const left = ((bounds.left + bounds.right) / 2 + offsetX) * scale + canvasRect.left;
+        const top = (bounds.top - 10 + offsetY) * scale + canvasRect.top;
+        return { left, top, right: left + width, bottom: top + height };
+    };
+
+    const getSelectionToolboxRect = () => {
+        const element = document.querySelector(SELECTION_TOOLBOX_SELECTOR);
+        const width = Number(element?.offsetWidth) || 0;
+        const height = Number(element?.offsetHeight) || 0;
+
+        if (element && width > 0 && height > 0) {
+            const anchor = getToolboxAnchorFromDom(element);
+            if (anchor) {
+                return {
+                    left: anchor[0],
+                    top: anchor[1],
+                    right: anchor[0] + width,
+                    bottom: anchor[1] + height,
+                };
+            }
+            const rect = element.getBoundingClientRect();
+            if (rect.width > 0 && rect.height > 0) {
+                return { left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom };
+            }
         }
 
-        const rect = element.getBoundingClientRect();
-        if (!rect.width || !rect.height) return null;
-        return { left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom };
+        // The toolbox is on but could not be found: fall back to where ComfyUI
+        // would put it, so the bar still steps aside.
+        if (!isSelectionToolboxEnabled()) return null;
+        return predictSelectionToolboxRect(
+            width || SELECTION_TOOLBOX_FALLBACK_WIDTH,
+            height || SELECTION_TOOLBOX_FALLBACK_HEIGHT,
+        );
     };
 
     const rectanglesOverlap = (a, b) => a.left < b.right
@@ -785,16 +869,22 @@ function installFontSliderBar() {
 
         // Step around the official selection toolbox instead of covering it: the
         // gap above it wins, and the bar only drops below when the viewport has
-        // no room left up there.
+        // no room left up there. A candidate that would still overlap is refused
+        // before it is used.
         const toolboxRect = getSelectionToolboxRect();
-        if (toolboxRect && rectanglesOverlap(
-            { left, top, right: left + width, bottom: top + height },
-            toolboxRect,
-        )) {
-            const aboveToolbox = toolboxRect.top - height - SELECTION_TOOLBOX_GAP;
-            const belowToolbox = toolboxRect.bottom + SELECTION_TOOLBOX_GAP;
-            if (aboveToolbox >= 8) top = aboveToolbox;
-            else if (belowToolbox <= maxTop) top = belowToolbox;
+        if (toolboxRect) {
+            const overlapsToolbox = (candidateTop) => rectanglesOverlap(
+                { left, top: candidateTop, right: left + width, bottom: candidateTop + height },
+                toolboxRect,
+            );
+            if (overlapsToolbox(top)) {
+                const aboveToolbox = toolboxRect.top - height - SELECTION_TOOLBOX_GAP;
+                const belowToolbox = toolboxRect.bottom + SELECTION_TOOLBOX_GAP;
+                if (aboveToolbox >= 8 && !overlapsToolbox(aboveToolbox)) top = aboveToolbox;
+                else if (belowToolbox <= maxTop && !overlapsToolbox(belowToolbox)) top = belowToolbox;
+                else if (aboveToolbox >= 8) top = aboveToolbox;
+                else if (belowToolbox <= maxTop) top = belowToolbox;
+            }
         }
 
         top = Math.min(Math.max(8, top), maxTop);
