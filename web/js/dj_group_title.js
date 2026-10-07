@@ -15,6 +15,9 @@ const FONT_SLIDER_PATCH_FLAG = "djGroupTitleFontSliderInstalled";
 const FONT_SLIDER_PIXELS_PER_STEP = 2;
 const FONT_SLIDER_VISUAL_MAX = 96;
 const GROUP_FONT_BAR_ATTR = "data-dj-group-title-bar";
+// 五名规则 #1：完整插件文件夹名。眼睛按钮点开后显示它，
+// 让用户知道"这个编组标题美化是哪个插件干的"（纯前端插件换电脑会静默降级，不留痕迹）。
+const PLUGIN_FOLDER_NAME = "ComfyUI-DJ_GroupTitle";
 const GROUP_FONT_BAR_WIDTH = 236;
 // ComfyUI's own selection toolbox, and the padding kept between it and the bar.
 const SELECTION_TOOLBOX_SELECTOR = '[data-testid="selection-toolbox"], .selection-toolbox';
@@ -708,6 +711,14 @@ function installFontSliderBar() {
     let frameHandle = 0;
     let pending = null;
     let lastTitleClick = null;
+    // 五名规则：眼睛按钮弹出的插件名气泡。放外层作用域，closePanel 时能一并清掉。
+    let nameBubble = null;
+    const hideNameBubble = () => {
+        if (nameBubble) {
+            nameBubble.remove();
+            nameBubble = null;
+        }
+    };
 
     const clampFontSize = (value) => {
         const numeric = Number(value);
@@ -975,6 +986,7 @@ function installFontSliderBar() {
         drag = null;
         panelState = null;
         stopFollow();
+        hideNameBubble(); // 横条收起时，眼睛气泡一并清掉
         if (panel) panel.style.display = "none";
     };
 
@@ -988,7 +1000,8 @@ function installFontSliderBar() {
             display: "none",
             alignItems: "center",
             gap: "8px",
-            width: `${GROUP_FONT_BAR_WIDTH}px`,
+            // 加宽：给尾部眼睛按钮留位置（原 236 + 眼睛区约 30）
+            width: `${GROUP_FONT_BAR_WIDTH + 30}px`,
             padding: "7px 8px",
             border: "1px solid rgba(255, 255, 255, 0.16)",
             borderRadius: "6px",
@@ -1042,7 +1055,72 @@ function installFontSliderBar() {
             boxSizing: "border-box",
         });
 
-        panel.append(track, numberInput);
+        // ── 五名规则：尾部眼睛按钮，点击弹出完整插件文件夹名 ──
+        // 纯前端插件换电脑会静默降级、不留痕迹，这个入口让用户能主动查到
+        // "编组标题美化是哪个插件干的"，凭名字去搜/装。
+        const eyeButton = document.createElement("button");
+        eyeButton.type = "button";
+        eyeButton.textContent = "👁";
+        eyeButton.title = "查看插件名";
+        Object.assign(eyeButton.style, {
+            width: "24px",
+            height: "24px",
+            padding: "0",
+            border: "1px solid rgba(255, 255, 255, 0.20)",
+            borderRadius: "4px",
+            background: "rgba(255, 255, 255, 0.06)",
+            color: "#d8e2e6",
+            fontSize: "13px",
+            cursor: "pointer",
+            flexShrink: "0",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+        });
+        eyeButton.addEventListener("pointerenter", () => {
+            eyeButton.style.background = "rgba(255, 255, 255, 0.16)";
+        });
+        eyeButton.addEventListener("pointerleave", () => {
+            eyeButton.style.background = "rgba(255, 255, 255, 0.06)";
+        });
+
+        // 气泡浮层：显示完整插件文件夹名，再点一次（或点别处）消失
+        eyeButton.addEventListener("click", (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            if (nameBubble) {
+                hideNameBubble();
+                return;
+            }
+            nameBubble = document.createElement("div");
+            // 五名规则：文字带"本功能隶属…节点"，让用户一眼看懂归属
+            nameBubble.textContent = `本功能隶属 ${PLUGIN_FOLDER_NAME} 节点`;
+            Object.assign(nameBubble.style, {
+                position: "fixed",
+                zIndex: "100003",
+                padding: "6px 10px",
+                background: "#1f222a",
+                border: "1px solid rgba(255, 255, 255, 0.22)",
+                borderRadius: "5px",
+                color: "#ffffff",
+                font: "12px/1.3 'Consolas', monospace",
+                boxShadow: "0 4px 16px rgba(0, 0, 0, 0.5)",
+                whiteSpace: "nowrap",
+                pointerEvents: "none",
+            });
+            document.body.appendChild(nameBubble);
+            // 定位在眼睛按钮右侧（垂直居中）
+            const rect = eyeButton.getBoundingClientRect();
+            nameBubble.style.left = `${rect.right + 8}px`;
+            nameBubble.style.top = `${rect.top + rect.height / 2}px`;
+            nameBubble.style.transform = "translate(0, -50%)";
+            // 点别处关闭（延迟注册，避免本次点击立即触发）
+            window.setTimeout(() => {
+                document.addEventListener("click", hideNameBubble, { once: true });
+            }, 0);
+        });
+
+        panel.append(track, numberInput, eyeButton);
         document.body.appendChild(panel);
 
         track.addEventListener("pointerdown", (event) => {
